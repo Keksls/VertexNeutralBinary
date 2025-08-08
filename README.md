@@ -1,4 +1,4 @@
-﻿# VertexNeutral v2 — Unity Mesh Exporter/Importer
+﻿# VertexNeutralBinary (vnb) v2 — Unity Mesh Exporter/Importer
 
 A tiny, dependency-free binary format and Unity-only toolkit for moving meshes (plus optional PBR material data) in and out of Unity.
 
@@ -11,7 +11,7 @@ A tiny, dependency-free binary format and Unity-only toolkit for moving meshes (
 
 ---
 
-## Why VertexNeutral?
+## Why VertexNeutralBinary (vnb)?
 
 - **Dead-simple**: One file, one mesh container, optional materials.
 - **Deterministic & fast**: Straightforward binary layout; no reflection/JSON.
@@ -24,7 +24,7 @@ A tiny, dependency-free binary format and Unity-only toolkit for moving meshes (
 
 ### Install (drop-in)
 
-1. Copy the `VertexNeutralV2` namespace file(s) into your Unity project (Editor or runtime assembly).
+1. Copy the `VertexNeutralBinary (vnb)V2` namespace file(s) into your Unity project (Editor or runtime assembly).
 2. Use the **Simple Facade API**:
 
 ```csharp
@@ -306,7 +306,7 @@ var vnb = VnExporter.Export(data);
 ### Import with an external texture resolver
 ```csharp
 byte[] bytes = File.ReadAllBytes(path);
-var res = VertexNeutralV2.VnImporter.Import(bytes, resolveExternalTexture: uri =>
+var res = VertexNeutralBinary (vnb)V2.VnImporter.Import(bytes, resolveExternalTexture: uri =>
 {
     // Resolve by texture name to PNG/JPG bytes, or return null to keep it external.
     var texPath = Path.Combine(Application.streamingAssetsPath, "Textures", uri + ".png");
