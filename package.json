@@ -5,7 +5,7 @@
   "description": "Unity package for Vertex Neutral Binary (VNB), providing tools for vertex-based neutral binary operations and related utilities.",
   "unity": "2021.3",
   "author": {
-    "name": "Kévin Bouetard",
+    "name": "Keksls",
     "email": "vrdtmstudio@gmail.com",
     "url": "https://github.com/Keksls/VertexNeutralBinary"
   },
