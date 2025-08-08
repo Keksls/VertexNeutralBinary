@@ -3,18 +3,17 @@
   "version": "1.0.0",
   "displayName": "Vertex Neutral Binary",
   "description": "Unity package for Vertex Neutral Binary (VNB), providing tools for vertex-based neutral binary operations and related utilities.",
-  "unity": "2021.3",
-  "author": {
-    "name": "Keksls",
-    "email": "vrdtmstudio@gmail.com",
-    "url": "https://github.com/Keksls/VertexNeutralBinary"
-  },
-  "license": "MIT",
   "keywords": [
     "vertex",
     "binary",
     "unity",
     "tools",
     "vnb"
-  ]
+  ],
+  "author": {
+    "name": "Keksls",
+    "email": "vrdtmstudio@gmail.com",
+    "url": "https://github.com/Keksls/fugui"
+  },
+  "type": "library"
 }
