@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using Unity.Collections;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -190,9 +191,27 @@ namespace VertexNeutralBinary
         public static void WriteArray(this BinaryWriter bw, float[] arr) { if (arr != null) foreach (var f in arr) bw.Write(f); }
         public static void WriteArray(this BinaryWriter bw, ushort[] arr) { if (arr != null) foreach (var v in arr) bw.Write(v); }
         public static void WriteArray(this BinaryWriter bw, uint[] arr) { if (arr != null) foreach (var v in arr) bw.Write(v); }
-        public static float[] ReadFloatArray(BinaryReader br, int count) { var a = new float[count]; for (int i = 0; i < count; i++) a[i] = br.ReadSingle(); return a; }
-        public static ushort[] ReadU16Array(BinaryReader br, int count) { var a = new ushort[count]; for (int i = 0; i < count; i++) a[i] = br.ReadUInt16(); return a; }
-        public static uint[] ReadU32Array(BinaryReader br, int count) { var a = new uint[count]; for (int i = 0; i < count; i++) a[i] = br.ReadUInt32(); return a; }
+        public static float[] ReadFloatArray(BinaryReader br, int count)
+        {
+            var bytes = br.ReadBytes(count * 4);
+            var arr = new float[count];
+            Buffer.BlockCopy(bytes, 0, arr, 0, bytes.Length);
+            return arr;
+        }
+        public static ushort[] ReadU16Array(BinaryReader br, int count)
+        {
+            var bytes = br.ReadBytes(count * 2);
+            var arr = new ushort[count];
+            Buffer.BlockCopy(bytes, 0, arr, 0, bytes.Length);
+            return arr;
+        }
+        public static uint[] ReadU32Array(BinaryReader br, int count)
+        {
+            var bytes = br.ReadBytes(count * 4);
+            var arr = new uint[count];
+            Buffer.BlockCopy(bytes, 0, arr, 0, bytes.Length);
+            return arr;
+        }
         public static string ReadUtf8(BinaryReader br) { var len = br.ReadUInt16(); var bytes = br.ReadBytes(len); return Encoding.UTF8.GetString(bytes); }
         public static void WriteUtf8(this BinaryWriter bw, string s) { var bytes = Encoding.UTF8.GetBytes(s ?? string.Empty); if (bytes.Length > ushort.MaxValue) throw new InvalidOperationException("String too long"); bw.Write((ushort)bytes.Length); bw.Write(bytes); }
     }
@@ -329,18 +348,18 @@ namespace VertexNeutralBinary
         /// <summary>
         /// Import VN v2 bytes. If magic/version mismatch, tries legacy v1 path (best-effort).
         /// </summary>
-        public static VnImportResult Import(byte[] bytes, Func<string, byte[]> resolveExternalTexture = null)
+        public static VnImportResult Import(byte[] bytes, bool makeMeshReadable, Func<string, byte[]> resolveExternalTexture = null)
         {
             using (var ms = new MemoryStream(bytes))
             using (var br = new BinaryReader(ms))
             {
                 Header h;
                 try { h = IO.ReadHeader(br); }
-                catch { return ImportV1(bytes); }
+                catch { return ImportV1(bytes, makeMeshReadable); }
 
                 if (h.Magic != 0x564E4232 || h.Version != 2)
                 {
-                    return ImportV1(bytes);
+                    return ImportV1(bytes, makeMeshReadable);
                 }
 
                 var flags = h.GlobalFlags;
@@ -435,14 +454,14 @@ namespace VertexNeutralBinary
                 }
 
                 var result = new VnImportResult { Data = data };
-                result.Mesh = BuildUnityMesh(data);
+                result.Mesh = BuildUnityMesh(data, makeMeshReadable);
                 result.Materials = BuildUnityMaterials(data.Materials);
                 return result;
             }
         }
 
         // —— Legacy v1 fallback (best-effort)
-        private static VnImportResult ImportV1(byte[] bytes)
+        private static VnImportResult ImportV1(byte[] bytes, bool readable)
         {
             var data = new VnMeshData();
             using (var ms = new MemoryStream(bytes))
@@ -476,78 +495,244 @@ namespace VertexNeutralBinary
                 data.SubMeshes.Add(new SubMeshDescVN { Topology = Topology.Triangles, MaterialIndex = 0xFFFF, StartIndex = 0, IndexCount = (uint)triTotal, BaseVertex = 0, FirstVertex = 0, VertexCount = (uint)vcount });
             }
 
-            return new VnImportResult { Data = data, Mesh = BuildUnityMesh(data), Materials = new Material[0] };
+            return new VnImportResult { Data = data, Mesh = BuildUnityMesh(data, readable), Materials = new Material[0] };
         }
 
-        private static Mesh BuildUnityMesh(VnMeshData d)
+        private static Mesh BuildUnityMesh(VnMeshData d, bool readable)
         {
+#if UNITY_2020_2_OR_NEWER
+            // ---- New path: single-shot GPU upload via MeshData ----
             var mesh = new Mesh();
             mesh.name = d.Name ?? "VN_Mesh";
+
             if (d.VertexCount > 65535) mesh.indexFormat = IndexFormat.UInt32;
 
-            if ((d.Flags & GlobalFlags.HasPositions) != 0)
+            // Describe vertex layout (interleaved stream)
+            var layout = new List<VertexAttributeDescriptor>(6);
+            layout.Add(new VertexAttributeDescriptor(VertexAttribute.Position, VertexAttributeFormat.Float32, 3, 0));
+            int stream = 0;
+            if ((d.Flags & GlobalFlags.HasNormals) != 0) layout.Add(new VertexAttributeDescriptor(VertexAttribute.Normal, VertexAttributeFormat.Float32, 3, stream));
+            if ((d.Flags & GlobalFlags.HasTangents) != 0) layout.Add(new VertexAttributeDescriptor(VertexAttribute.Tangent, VertexAttributeFormat.Float32, 4, stream));
+            if ((d.Flags & GlobalFlags.HasVertexColors) != 0) layout.Add(new VertexAttributeDescriptor(VertexAttribute.Color, VertexAttributeFormat.Float32, 4, stream));
+            if ((d.Flags & GlobalFlags.HasUV0) != 0) layout.Add(new VertexAttributeDescriptor(VertexAttribute.TexCoord0, VertexAttributeFormat.Float32, 2, stream));
+            if ((d.Flags & GlobalFlags.HasUV1) != 0) layout.Add(new VertexAttributeDescriptor(VertexAttribute.TexCoord1, VertexAttributeFormat.Float32, 2, stream));
+
+            var meshDataArray = Mesh.AllocateWritableMeshData(1);
+            var md = meshDataArray[0];
+
+            // Compute vertex stride
+            int stride = 3 * sizeof(float); // position
+            if ((d.Flags & GlobalFlags.HasNormals) != 0) stride += 3 * sizeof(float);
+            if ((d.Flags & GlobalFlags.HasTangents) != 0) stride += 4 * sizeof(float);
+            if ((d.Flags & GlobalFlags.HasVertexColors) != 0) stride += 4 * sizeof(float);
+            if ((d.Flags & GlobalFlags.HasUV0) != 0) stride += 2 * sizeof(float);
+            if ((d.Flags & GlobalFlags.HasUV1) != 0) stride += 2 * sizeof(float);
+
+            md.SetVertexBufferParams((int)d.VertexCount, layout.ToArray());
+            md.SetIndexBufferParams((int)d.IndexCount, (d.Flags & GlobalFlags.IndicesU16) != 0 ? IndexFormat.UInt16 : IndexFormat.UInt32);
+
+            // Fill vertex buffer (interleaved) in one pass
+            var vb = md.GetVertexData<byte>(0);
+            int offsetPos = 0;
+            int offset = 0;
+            int offNormal = offsetPos + 3 * sizeof(float);
+            int offTangent = offNormal + (((d.Flags & GlobalFlags.HasNormals) != 0) ? 3 * sizeof(float) : 0);
+            int offColor = offTangent + (((d.Flags & GlobalFlags.HasTangents) != 0) ? 4 * sizeof(float) : 0);
+            int offUV0 = offColor + (((d.Flags & GlobalFlags.HasVertexColors) != 0) ? 4 * sizeof(float) : 0);
+            int offUV1 = offUV0 + (((d.Flags & GlobalFlags.HasUV0) != 0) ? 2 * sizeof(float) : 0);
+
+            // Local helpers to write floats without unsafe
+            void WriteFloat(byte[] dst, int baseOffset, float v) { Buffer.BlockCopy(BitConverter.GetBytes(v), 0, dst, baseOffset, 4); }
+
+            // We’ll write into a temporary row buffer to avoid many BitConverter allocations per component
+            var row = new byte[stride];
+            for (int i = 0; i < d.VertexCount; i++)
             {
-                var vtx = new Vector3[d.VertexCount];
-                for (int i = 0; i < vtx.Length; i++) vtx[i] = new Vector3(d.Positions[i * 3 + 0], d.Positions[i * 3 + 1], d.Positions[i * 3 + 2]);
-                mesh.SetVertices(new List<Vector3>(vtx));
-            }
-            if ((d.Flags & GlobalFlags.HasNormals) != 0)
-            {
-                var n = new Vector3[d.VertexCount];
-                for (int i = 0; i < n.Length; i++) n[i] = new Vector3(d.Normals[i * 3 + 0], d.Normals[i * 3 + 1], d.Normals[i * 3 + 2]);
-                mesh.SetNormals(new List<Vector3>(n));
-            }
-            if ((d.Flags & GlobalFlags.HasTangents) != 0)
-            {
-                var t = new Vector4[d.VertexCount];
-                for (int i = 0; i < t.Length; i++) t[i] = new Vector4(d.Tangents[i * 4 + 0], d.Tangents[i * 4 + 1], d.Tangents[i * 4 + 2], d.Tangents[i * 4 + 3]);
-                mesh.SetTangents(new List<Vector4>(t));
-            }
-            if ((d.Flags & GlobalFlags.HasVertexColors) != 0)
-            {
-                var c = new Color[d.VertexCount];
-                for (int i = 0; i < c.Length; i++) c[i] = new Color(d.Colors[i * 4 + 0], d.Colors[i * 4 + 1], d.Colors[i * 4 + 2], d.Colors[i * 4 + 3]);
-                mesh.SetColors(new List<Color>(c));
-            }
-            if ((d.Flags & GlobalFlags.HasUV0) != 0)
-            {
-                var u0 = new Vector2[d.VertexCount];
-                for (int i = 0; i < u0.Length; i++) u0[i] = new Vector2(d.UV0[i * 2 + 0], d.UV0[i * 2 + 1]);
-                mesh.SetUVs(0, new List<Vector2>(u0));
-            }
-            if ((d.Flags & GlobalFlags.HasUV1) != 0)
-            {
-                var u1 = new Vector2[d.VertexCount];
-                for (int i = 0; i < u1.Length; i++) u1[i] = new Vector2(d.UV1[i * 2 + 0], d.UV1[i * 2 + 1]);
-                mesh.SetUVs(1, new List<Vector2>(u1));
+                int rowOff = 0;
+                // pos
+                WriteFloat(row, rowOff + 0, d.Positions[i * 3 + 0]);
+                WriteFloat(row, rowOff + 4, d.Positions[i * 3 + 1]);
+                WriteFloat(row, rowOff + 8, d.Positions[i * 3 + 2]);
+
+                rowOff = offNormal;
+                if ((d.Flags & GlobalFlags.HasNormals) != 0)
+                {
+                    WriteFloat(row, rowOff + 0, d.Normals[i * 3 + 0]);
+                    WriteFloat(row, rowOff + 4, d.Normals[i * 3 + 1]);
+                    WriteFloat(row, rowOff + 8, d.Normals[i * 3 + 2]);
+                }
+
+                rowOff = offTangent;
+                if ((d.Flags & GlobalFlags.HasTangents) != 0)
+                {
+                    WriteFloat(row, rowOff + 0, d.Tangents[i * 4 + 0]);
+                    WriteFloat(row, rowOff + 4, d.Tangents[i * 4 + 1]);
+                    WriteFloat(row, rowOff + 8, d.Tangents[i * 4 + 2]);
+                    WriteFloat(row, rowOff + 12, d.Tangents[i * 4 + 3]);
+                }
+
+                rowOff = offColor;
+                if ((d.Flags & GlobalFlags.HasVertexColors) != 0)
+                {
+                    WriteFloat(row, rowOff + 0, d.Colors[i * 4 + 0]);
+                    WriteFloat(row, rowOff + 4, d.Colors[i * 4 + 1]);
+                    WriteFloat(row, rowOff + 8, d.Colors[i * 4 + 2]);
+                    WriteFloat(row, rowOff + 12, d.Colors[i * 4 + 3]);
+                }
+
+                rowOff = offUV0;
+                if ((d.Flags & GlobalFlags.HasUV0) != 0)
+                {
+                    WriteFloat(row, rowOff + 0, d.UV0[i * 2 + 0]);
+                    WriteFloat(row, rowOff + 4, d.UV0[i * 2 + 1]);
+                }
+
+                rowOff = offUV1;
+                if ((d.Flags & GlobalFlags.HasUV1) != 0)
+                {
+                    WriteFloat(row, rowOff + 0, d.UV1[i * 2 + 0]);
+                    WriteFloat(row, rowOff + 4, d.UV1[i * 2 + 1]);
+                }
+
+                // copy row to vb
+                vb.Slice(i * stride, stride).CopyFrom(row);
             }
 
-            if ((d.Flags & GlobalFlags.IndicesU16) != 0) mesh.SetIndices(Array.ConvertAll((ushort[])d.Indices, x => (int)x), MeshTopology.Triangles, 0, false);
-            else mesh.SetIndices(Array.ConvertAll((uint[])d.Indices, x => (int)x), MeshTopology.Triangles, 0, false);
+            // Index buffer (single write)
+            if ((d.Flags & GlobalFlags.IndicesU16) != 0)
+            {
+                var dst = md.GetIndexData<ushort>();
+                var src = (ushort[])d.Indices;
+                dst.CopyFrom(src);
+            }
+            else
+            {
+                var dst = md.GetIndexData<uint>();
+                var src = (uint[])d.Indices;
+                dst.CopyFrom(src);
+            }
 
-            mesh.subMeshCount = d.SubMeshes.Count;
-            for (int i = 0; i < d.SubMeshes.Count; i++)
+            // Submeshes in one call
+            var subCount = d.SubMeshes.Count;
+            var subDescs = new SubMeshDescriptor[subCount];
+            for (int i = 0; i < subCount; i++)
             {
                 var s = d.SubMeshes[i];
-                var desc = new SubMeshDescriptor((int)s.StartIndex, (int)s.IndexCount)
+                subDescs[i] = new SubMeshDescriptor((int)s.StartIndex, (int)s.IndexCount)
                 {
                     baseVertex = s.BaseVertex,
                     topology = s.Topology == Topology.Triangles ? MeshTopology.Triangles : MeshTopology.Lines,
                     firstVertex = (int)s.FirstVertex,
                     vertexCount = (int)s.VertexCount
                 };
-                mesh.SetSubMesh(i, desc, MeshUpdateFlags.DontRecalculateBounds);
             }
+            md.subMeshCount = subCount;
+            for (int i = 0; i < subCount; i++) md.SetSubMesh(i, subDescs[i], MeshUpdateFlags.DontRecalculateBounds | MeshUpdateFlags.DontValidateIndices | MeshUpdateFlags.DontNotifyMeshUsers);
 
+            // Bounds
+            Bounds? providedBounds = null;
             if ((d.Flags & GlobalFlags.HasBounds) != 0)
             {
                 var bmin = new Vector3(d.BoundsMin[0], d.BoundsMin[1], d.BoundsMin[2]);
                 var bmax = new Vector3(d.BoundsMax[0], d.BoundsMax[1], d.BoundsMax[2]);
-                mesh.bounds = new Bounds((bmin + bmax) * 0.5f, bmax - bmin);
+                providedBounds = new Bounds((bmin + bmax) * 0.5f, bmax - bmin);
             }
-            else mesh.RecalculateBounds();
+
+            // Apply to Mesh and make it non-readable (frees system memory copy)
+            Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, mesh, MeshUpdateFlags.DontRecalculateBounds | MeshUpdateFlags.DontValidateIndices | MeshUpdateFlags.DontNotifyMeshUsers);
+
+            if (providedBounds.HasValue)
+                mesh.bounds = providedBounds.Value;
+            else
+                mesh.RecalculateBounds();
+
+            mesh.UploadMeshData(!readable); // non-readable: big memory + perf win
 
             return mesh;
+
+#else
+    // ---- Fallback path (older Unity): trim allocs & calls ----
+    var mesh = new Mesh();
+    mesh.name = d.Name ?? "VN_Mesh";
+    if (d.VertexCount > 65535) mesh.indexFormat = IndexFormat.UInt32;
+
+    // Use arrays, not List<>, to avoid alloc churn
+    if ((d.Flags & GlobalFlags.HasPositions) != 0)
+    {
+        var vtx = new Vector3[d.VertexCount];
+        for (int i = 0; i < vtx.Length; i++)
+            vtx[i] = new Vector3(d.Positions[i*3+0], d.Positions[i*3+1], d.Positions[i*3+2]);
+        mesh.SetVertices(vtx);
+    }
+    if ((d.Flags & GlobalFlags.HasNormals) != 0)
+    {
+        var n = new Vector3[d.VertexCount];
+        for (int i = 0; i < n.Length; i++)
+            n[i] = new Vector3(d.Normals[i*3+0], d.Normals[i*3+1], d.Normals[i*3+2]);
+        mesh.SetNormals(n);
+    }
+    if ((d.Flags & GlobalFlags.HasTangents) != 0)
+    {
+        var t = new Vector4[d.VertexCount];
+        for (int i = 0; i < t.Length; i++)
+            t[i] = new Vector4(d.Tangents[i*4+0], d.Tangents[i*4+1], d.Tangents[i*4+2], d.Tangents[i*4+3]);
+        mesh.SetTangents(t);
+    }
+    if ((d.Flags & GlobalFlags.HasVertexColors) != 0)
+    {
+        var c = new Color[d.VertexCount];
+        for (int i = 0; i < c.Length; i++)
+            c[i] = new Color(d.Colors[i*4+0], d.Colors[i*4+1], d.Colors[i*4+2], d.Colors[i*4+3]);
+        mesh.SetColors(c);
+    }
+    if ((d.Flags & GlobalFlags.HasUV0) != 0)
+    {
+        var u0 = new Vector2[d.VertexCount];
+        for (int i = 0; i < u0.Length; i++)
+            u0[i] = new Vector2(d.UV0[i*2+0], d.UV0[i*2+1]);
+        mesh.SetUVs(0, u0);
+    }
+    if ((d.Flags & GlobalFlags.HasUV1) != 0)
+    {
+        var u1 = new Vector2[d.VertexCount];
+        for (int i = 0; i < u1.Length; i++)
+            u1[i] = new Vector2(d.UV1[i*2+0], d.UV1[i*2+1]);
+        mesh.SetUVs(1, u1);
+    }
+
+    // Indices
+    if ((d.Flags & GlobalFlags.IndicesU16) != 0)
+        mesh.SetIndices(Array.ConvertAll((ushort[])d.Indices, x => (int)x), MeshTopology.Triangles, 0, false);
+    else
+        mesh.SetIndices(Array.ConvertAll((uint[])d.Indices,   x => (int)x), MeshTopology.Triangles, 0, false);
+
+    // Submeshes in one pass
+    mesh.subMeshCount = d.SubMeshes.Count;
+    var updates = MeshUpdateFlags.DontRecalculateBounds | MeshUpdateFlags.DontValidateIndices | MeshUpdateFlags.DontNotifyMeshUsers;
+    for (int i = 0; i < d.SubMeshes.Count; i++)
+    {
+        var s = d.SubMeshes[i];
+        var desc = new SubMeshDescriptor((int)s.StartIndex, (int)s.IndexCount)
+        {
+            baseVertex  = s.BaseVertex,
+            topology    = s.Topology == Topology.Triangles ? MeshTopology.Triangles : MeshTopology.Lines,
+            firstVertex = (int)s.FirstVertex,
+            vertexCount = (int)s.VertexCount
+        };
+        mesh.SetSubMesh(i, desc, updates);
+    }
+
+    if ((d.Flags & GlobalFlags.HasBounds) != 0)
+    {
+        var bmin = new Vector3(d.BoundsMin[0], d.BoundsMin[1], d.BoundsMin[2]);
+        var bmax = new Vector3(d.BoundsMax[0], d.BoundsMax[1], d.BoundsMax[2]);
+        mesh.bounds = new Bounds((bmin + bmax) * 0.5f, bmax - bmin);
+    }
+    else mesh.RecalculateBounds();
+
+    mesh.UploadMeshData(true); // free CPU copy
+    return mesh;
+#endif
         }
 
         private static Material[] BuildUnityMaterials(List<PbrMaterialVN> list)
@@ -585,6 +770,8 @@ namespace VertexNeutralBinary
                 var tex = new Texture2D(2, 2, TextureFormat.RGBA32, true);
                 tex.name = m.Name + "_" + t.Slot;
                 tex.LoadImage(t.EmbeddedData, true);
+                tex.wrapModeU = t.Sampler?.WrapU == 1 ? TextureWrapMode.Clamp : TextureWrapMode.Repeat;
+                tex.wrapModeV = t.Sampler?.WrapV == 1 ? TextureWrapMode.Clamp : TextureWrapMode.Repeat;
 
                 string prop = TexturePropertyFromSlot(t.Slot);
                 if (!string.IsNullOrEmpty(prop))
@@ -652,13 +839,233 @@ namespace VertexNeutralBinary
         public static VnMeshData FromUnityMesh(Mesh mesh, List<SubMeshDescVN> subDescs, bool withNormals = true, bool withTangents = false, bool withColors = false, bool withUV1 = false, bool indicesU16 = false)
         {
             if (mesh == null) throw new ArgumentNullException("mesh");
+#if UNITY_2020_2_OR_NEWER
+            var data = new VnMeshData();
+            data.Name = mesh.name;
+            data.Flags = GlobalFlags.HasPositions;
+
+            using (var mda = Mesh.AcquireReadOnlyMeshData(mesh))
+            {
+                var md = mda[0];
+                int v = md.vertexCount;
+                data.VertexCount = (uint)v;
+
+                // ---------- Positions (required) ----------
+                var pos = new NativeArray<Vector3>(v, Allocator.Temp);
+                md.GetVertices(pos);
+                data.Positions = new float[v * 3];
+                for (int i = 0; i < v; i++)
+                {
+                    var p = pos[i];
+                    int o = i * 3;
+                    data.Positions[o + 0] = p.x;
+                    data.Positions[o + 1] = p.y;
+                    data.Positions[o + 2] = p.z;
+                }
+                pos.Dispose();
+
+                // ---------- Normals ----------
+                if (withNormals && md.HasVertexAttribute(VertexAttribute.Normal))
+                {
+                    var nor = new NativeArray<Vector3>(v, Allocator.Temp);
+                    md.GetNormals(nor);
+                    data.Normals = new float[v * 3];
+                    for (int i = 0; i < v; i++)
+                    {
+                        var n = nor[i];
+                        int o = i * 3;
+                        data.Normals[o + 0] = n.x;
+                        data.Normals[o + 1] = n.y;
+                        data.Normals[o + 2] = n.z;
+                    }
+                    nor.Dispose();
+                    data.Flags |= GlobalFlags.HasNormals;
+                }
+
+                // ---------- Tangents ----------
+                if (withTangents && md.HasVertexAttribute(VertexAttribute.Tangent))
+                {
+                    var tan = new NativeArray<Vector4>(v, Allocator.Temp);
+                    md.GetTangents(tan);
+                    data.Tangents = new float[v * 4];
+                    for (int i = 0; i < v; i++)
+                    {
+                        var t = tan[i];
+                        int o = i * 4;
+                        data.Tangents[o + 0] = t.x;
+                        data.Tangents[o + 1] = t.y;
+                        data.Tangents[o + 2] = t.z;
+                        data.Tangents[o + 3] = t.w;
+                    }
+                    tan.Dispose();
+                    data.Flags |= GlobalFlags.HasTangents;
+                }
+
+                // ---------- Vertex Colors ----------
+                if (withColors && md.HasVertexAttribute(VertexAttribute.Color))
+                {
+                    var col = new NativeArray<Color>(v, Allocator.Temp);
+                    md.GetColors(col);
+                    data.Colors = new float[v * 4];
+                    for (int i = 0; i < v; i++)
+                    {
+                        var c = col[i];
+                        int o = i * 4;
+                        data.Colors[o + 0] = c.r;
+                        data.Colors[o + 1] = c.g;
+                        data.Colors[o + 2] = c.b;
+                        data.Colors[o + 3] = c.a;
+                    }
+                    col.Dispose();
+                    data.Flags |= GlobalFlags.HasVertexColors;
+                }
+
+                // ---------- UV0 ----------
+                if (md.HasVertexAttribute(VertexAttribute.TexCoord0))
+                {
+                    var uv0 = new NativeArray<Vector2>(v, Allocator.Temp);
+                    md.GetUVs(0, uv0);
+                    if (uv0.Length == v) // safety
+                    {
+                        data.UV0 = new float[v * 2];
+                        for (int i = 0; i < v; i++)
+                        {
+                            var u = uv0[i];
+                            int o = i * 2;
+                            data.UV0[o + 0] = u.x;
+                            data.UV0[o + 1] = u.y;
+                        }
+                        data.Flags |= GlobalFlags.HasUV0;
+                    }
+                    uv0.Dispose();
+                }
+
+                // ---------- UV1 ----------
+                if (withUV1 && md.HasVertexAttribute(VertexAttribute.TexCoord1))
+                {
+                    var uv1 = new NativeArray<Vector2>(v, Allocator.Temp);
+                    md.GetUVs(1, uv1);
+                    if (uv1.Length == v)
+                    {
+                        data.UV1 = new float[v * 2];
+                        for (int i = 0; i < v; i++)
+                        {
+                            var u = uv1[i];
+                            int o = i * 2;
+                            data.UV1[o + 0] = u.x;
+                            data.UV1[o + 1] = u.y;
+                        }
+                        data.Flags |= GlobalFlags.HasUV1;
+                    }
+                    uv1.Dispose();
+                }
+
+                // ---------- Submeshes + Indices (aggregate once) ----------
+                int subCount = md.subMeshCount;
+                subDescs = subDescs ?? new List<SubMeshDescVN>(subCount);
+                subDescs.Clear();
+
+                // First pass: compute total index count + decide 16/32-bit
+                long totalIdx = 0;
+                uint maxIndex = 0;
+
+                for (int si = 0; si < subCount; si++)
+                {
+                    var smd = md.GetSubMesh(si);
+                    totalIdx += smd.indexCount;
+
+                    // Quick max scan to decide U16 vs U32
+                    // Use a small temp buffer to avoid allocating huge arrays at once
+                    var tmp = new NativeArray<int>((int)smd.indexCount, Allocator.Temp);
+                    md.GetIndices(tmp, si);
+                    for (int k = 0; k < tmp.Length; k++)
+                    {
+                        uint idx = (uint)tmp[k];
+                        if (idx > maxIndex) maxIndex = idx;
+                    }
+                    tmp.Dispose();
+                }
+
+                bool canU16 = (data.VertexCount <= 65535u) && (maxIndex <= ushort.MaxValue);
+                bool useU16 = indicesU16 ? canU16 : canU16; // force U16 when possible
+
+                // Allocate final index buffer
+                data.IndexCount = (uint)totalIdx;
+                if (useU16)
+                {
+                    var all = new ushort[totalIdx];
+                    int cursor = 0;
+
+                    for (int si = 0; si < subCount; si++)
+                    {
+                        var smd = md.GetSubMesh(si);
+                        var tmp = new NativeArray<int>((int)smd.indexCount, Allocator.Temp);
+                        md.GetIndices(tmp, si);
+
+                        // Record submesh desc
+                        var sd = new SubMeshDescVN
+                        {
+                            Topology = smd.topology == MeshTopology.Triangles ? Topology.Triangles : Topology.Lines,
+                            MaterialIndex = 0xFFFF,
+                            StartIndex = (uint)cursor,
+                            IndexCount = (uint)tmp.Length,
+                            BaseVertex = smd.baseVertex,
+                            FirstVertex = (uint)smd.firstVertex,
+                            VertexCount = (uint)smd.vertexCount
+                        };
+                        subDescs.Add(sd);
+
+                        // Copy indices
+                        for (int k = 0; k < tmp.Length; k++) all[cursor++] = (ushort)tmp[k];
+
+                        tmp.Dispose();
+                    }
+
+                    data.Indices = all;
+                    data.Flags |= GlobalFlags.IndicesU16;
+                }
+                else
+                {
+                    var all = new uint[totalIdx];
+                    int cursor = 0;
+
+                    for (int si = 0; si < subCount; si++)
+                    {
+                        var smd = md.GetSubMesh(si);
+                        var tmp = new NativeArray<int>((int)smd.indexCount, Allocator.Temp);
+                        md.GetIndices(tmp, si);
+
+                        var sd = new SubMeshDescVN
+                        {
+                            Topology = smd.topology == MeshTopology.Triangles ? Topology.Triangles : Topology.Lines,
+                            MaterialIndex = 0xFFFF,
+                            StartIndex = (uint)cursor,
+                            IndexCount = (uint)tmp.Length,
+                            BaseVertex = smd.baseVertex,
+                            FirstVertex = (uint)smd.firstVertex,
+                            VertexCount = (uint)smd.vertexCount
+                        };
+                        subDescs.Add(sd);
+
+                        for (int k = 0; k < tmp.Length; k++) all[cursor++] = (uint)tmp[k];
+
+                        tmp.Dispose();
+                    }
+
+                    data.Indices = all;
+                    // no IndicesU16 flag
+                }
+
+                data.SubMeshes = subDescs;
+            }
+
+            return data;
+#else
             var data = new VnMeshData();
             data.Flags = GlobalFlags.HasPositions;
-            if (mesh.uv != null && mesh.uv.Length > 0) data.Flags |= GlobalFlags.HasUV0;
             if (withNormals && mesh.normals != null && mesh.normals.Length == mesh.vertexCount) data.Flags |= GlobalFlags.HasNormals;
             if (withTangents && mesh.tangents != null && mesh.tangents.Length == mesh.vertexCount) data.Flags |= GlobalFlags.HasTangents;
             if (withColors && mesh.colors != null && mesh.colors.Length == mesh.vertexCount) data.Flags |= GlobalFlags.HasVertexColors;
-            if (withUV1 && mesh.uv2.Length > 0) data.Flags |= GlobalFlags.HasUV1;
             if (indicesU16) data.Flags |= GlobalFlags.IndicesU16;
 
             int v = mesh.vertexCount;
@@ -668,8 +1075,24 @@ namespace VertexNeutralBinary
             if ((data.Flags & GlobalFlags.HasTangents) != 0) { var t = mesh.tangents; data.Tangents = new float[v * 4]; for (int i = 0; i < v; i++) { var p = t[i]; data.Tangents[i * 4 + 0] = p.x; data.Tangents[i * 4 + 1] = p.y; data.Tangents[i * 4 + 2] = p.z; data.Tangents[i * 4 + 3] = p.w; } }
             if ((data.Flags & GlobalFlags.HasVertexColors) != 0) { var c = mesh.colors; data.Colors = new float[v * 4]; for (int i = 0; i < v; i++) { var p = c[i]; data.Colors[i * 4 + 0] = p.r; data.Colors[i * 4 + 1] = p.g; data.Colors[i * 4 + 2] = p.b; data.Colors[i * 4 + 3] = p.a; } }
 
-            var uv0 = new List<Vector2>(); mesh.GetUVs(0, uv0); if (uv0.Count == v) { data.UV0 = new float[v * 2]; for (int i = 0; i < v; i++) { var p = uv0[i]; data.UV0[i * 2 + 0] = p.x; data.UV0[i * 2 + 1] = p.y; } }
-            if ((data.Flags & GlobalFlags.HasUV1) != 0) { var uv1 = new List<Vector2>(); mesh.GetUVs(1, uv1); if (uv1.Count == v) { data.UV1 = new float[v * 2]; for (int i = 0; i < v; i++) { var p = uv1[i]; data.UV1[i * 2 + 0] = p.x; data.UV1[i * 2 + 1] = p.y; } } }
+            var uv0Arr = mesh.uv;
+            if (uv0Arr != null && uv0Arr.Length == v)
+            {
+                data.UV0 = new float[v * 2];
+                for (int i = 0; i < v; i++) { var p = uv0Arr[i]; data.UV0[i * 2 + 0] = p.x; data.UV0[i * 2 + 1] = p.y; }
+                data.Flags |= GlobalFlags.HasUV0;
+            }
+
+            if (withUV1)
+            {
+                var uv1Arr = mesh.uv2;
+                if (uv1Arr != null && uv1Arr.Length == v)
+                {
+                    data.UV1 = new float[v * 2];
+                    for (int i = 0; i < v; i++) { var p = uv1Arr[i]; data.UV1[i * 2 + 0] = p.x; data.UV1[i * 2 + 1] = p.y; }
+                    data.Flags |= GlobalFlags.HasUV1;
+                }
+            }
 
             var all = new List<int>();
             subDescs = subDescs ?? new List<SubMeshDescVN>();
@@ -704,6 +1127,8 @@ namespace VertexNeutralBinary
             data.VertexCount = (uint)v;
             return data;
         }
+#endif
+        }
     }
     #endregion
 
@@ -713,9 +1138,9 @@ namespace VertexNeutralBinary
         /// <summary>
         /// Import VN v2 bytes and return a ready-to-use GameObject with MeshFilter + MeshRenderer.
         /// </summary>
-        public static GameObject Import(byte[] bytes, bool addColliders = false)
+        public static GameObject Import(byte[] bytes, bool addColliders = false, bool makeMeshReadable = true)
         {
-            var result = VertexNeutralBinary.VnImporter.Import(bytes, null);
+            var result = VertexNeutralBinary.VnImporter.Import(bytes, makeMeshReadable, null);
 
             var name = result.Data != null
                         && result.Data.Name != null ?
